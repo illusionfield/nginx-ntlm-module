@@ -268,6 +268,7 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
     ngx_http_upstream_t *u;
     ngx_pool_cleanup_t *cln;
     ngx_http_upstream_ntlm_cache_t *cleanup_item = NULL;
+    ngx_int_t cached_success = 0;  // flag to indicate successful caching
 
     /* cache valid connections */
     u = hndp->upstream;
@@ -304,26 +305,18 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
         q = ngx_queue_last(&hndp->conf->cache);
         ngx_queue_remove(q);
         item = ngx_queue_data(q, ngx_http_upstream_ntlm_cache_t, queue);
-        item->in_queue = 0;
         ngx_http_upstream_ntlm_close(item->peer_connection);
         item->peer_connection = NULL;
     } else {
         q = ngx_queue_head(&hndp->conf->free);
         ngx_queue_remove(q);
         item = ngx_queue_data(q, ngx_http_upstream_ntlm_cache_t, queue);
-        item->in_queue = 0;
     }
 
     ngx_queue_insert_head(&hndp->conf->cache, q);
-    item->in_queue = 1;
 
     item->peer_connection = c;
     item->client_connection = hndp->client_connection;
-
-    ngx_log_debug2(
-        NGX_LOG_DEBUG_HTTP, pc->log, 0,
-        "ntlm free peer saving item client_connection %p, pear connection %p",
-        item->client_connection, c);
 
     /* create the client connection drop down handler */
     for (cln = item->client_connection->pool->cleanup; cln; cln = cln->next) {
@@ -364,6 +357,12 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
 
     if (c->read->ready) {
         ngx_http_upstream_ntlm_close_handler(c->read);
+    }
+
+    cached_success = 1;
+
+    if (cached_success) {
+        return;  // early return to prevent double freeing
     }
 
 invalid:
