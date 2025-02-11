@@ -41,6 +41,7 @@ typedef struct {
     ngx_queue_t queue;
     ngx_connection_t *peer_connection;
     ngx_connection_t *client_connection;
+    unsigned in_queue:1;  /* new flag: 1 = the item is present in one of the queues */
 } ngx_http_upstream_ntlm_cache_t;
 
 typedef struct {
@@ -133,6 +134,7 @@ static ngx_int_t ngx_http_upstream_init_ntlm(ngx_conf_t *cf,
     for (i = 0; i < hncf->max_cached; i++) {
         ngx_queue_insert_head(&hncf->free, &cached[i].queue);
         cached[i].conf = hncf;
+        cached[i].in_queue = 1;  /* initially inserted into the free queue */
     }
 
     return NGX_OK;
@@ -145,10 +147,10 @@ ngx_http_upstream_init_ntlm_peer(ngx_http_request_t *r,
     ngx_http_upstream_ntlm_srv_conf_t *hncf;
     ngx_str_t auth_header_value;
 
-    // get the upstream configuration
+    /* get the upstream configuration */
     hncf = ngx_http_conf_upstream_srv_conf(us, ngx_http_upstream_ntlm_module);
 
-    // alocate memory for peer data
+    /* allocate memory for peer data */
     hnpd = ngx_palloc(r->pool, sizeof(ngx_http_upstream_ntlm_peer_data_t));
     if (hnpd == NULL) {
         return NGX_ERROR;
@@ -203,13 +205,11 @@ static ngx_int_t ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc,
                                                  void *data) {
     ngx_http_upstream_ntlm_peer_data_t *hndp = data;
     ngx_http_upstream_ntlm_cache_t *item;
-
-    ngx_int_t rc;
     ngx_queue_t *q, *cache;
     ngx_connection_t *c;
+    ngx_int_t rc;
 
     /* ask balancer */
-
     rc = hndp->original_get_peer(pc, hndp->data);
 
     if (rc != NGX_OK) {
@@ -217,7 +217,6 @@ static ngx_int_t ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc,
     }
 
     /* search cache for suitable connection */
-
     cache = &hndp->conf->cache;
 
     for (q = ngx_queue_head(cache); q != ngx_queue_sentinel(cache);
@@ -227,7 +226,9 @@ static ngx_int_t ngx_http_upstream_get_ntlm_peer(ngx_peer_connection_t *pc,
         if (item->client_connection == hndp->client_connection) {
             c = item->peer_connection;
             ngx_queue_remove(q);
+            item->in_queue = 0;
             ngx_queue_insert_head(&hndp->conf->free, q);
+            item->in_queue = 1;
             hndp->cached = 1;
             goto found;
         }
@@ -262,7 +263,6 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
                                              void *data, ngx_uint_t state) {
     ngx_http_upstream_ntlm_peer_data_t *hndp = data;
     ngx_http_upstream_ntlm_cache_t *item;
-
     ngx_queue_t *q;
     ngx_connection_t *c;
     ngx_http_upstream_t *u;
@@ -270,7 +270,6 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
     ngx_http_upstream_ntlm_cache_t *cleanup_item = NULL;
 
     /* cache valid connections */
-
     u = hndp->upstream;
     c = pc->connection;
 
@@ -300,20 +299,23 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
         goto invalid;
     }
 
+    /* take a cache slot */
     if (ngx_queue_empty(&hndp->conf->free)) {
         q = ngx_queue_last(&hndp->conf->cache);
         ngx_queue_remove(q);
-
         item = ngx_queue_data(q, ngx_http_upstream_ntlm_cache_t, queue);
+        item->in_queue = 0;
         ngx_http_upstream_ntlm_close(item->peer_connection);
         item->peer_connection = NULL;
     } else {
         q = ngx_queue_head(&hndp->conf->free);
         ngx_queue_remove(q);
         item = ngx_queue_data(q, ngx_http_upstream_ntlm_cache_t, queue);
+        item->in_queue = 0;
     }
 
     ngx_queue_insert_head(&hndp->conf->cache, q);
+    item->in_queue = 1;
 
     item->peer_connection = c;
     item->client_connection = hndp->client_connection;
@@ -323,7 +325,7 @@ static void ngx_http_upstream_free_ntlm_peer(ngx_peer_connection_t *pc,
         "ntlm free peer saving item client_connection %p, pear connection %p",
         item->client_connection, c);
 
-    // create the client connection drop down handler
+    /* create the client connection drop down handler */
     for (cln = item->client_connection->pool->cleanup; cln; cln = cln->next) {
         if (cln->handler == ngx_http_upstream_client_conn_cleanup) {
             cleanup_item = cln->data;
@@ -370,20 +372,23 @@ invalid:
 
 static void ngx_http_upstream_client_conn_cleanup(void *data) {
     ngx_http_upstream_ntlm_cache_t *item = data;
-    
+
     ngx_log_debug2(
         NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-        "ntlm client connection closed %p, droping peer connection %p",
+        "ntlm client connection closed %p, dropping peer connection %p",
         item->client_connection, item->peer_connection);
 
-    // Check if the item was removed previously from the queue (backend drop)
+    // If the item is still in the queue, remove it before the client connection closes (to avoid double removal)
     if (item->peer_connection != NULL) {
-
         item->peer_connection->read->timedout = 1;
-        ngx_post_event(item->peer_connection->read,&ngx_posted_events);
+        ngx_post_event(item->peer_connection->read, &ngx_posted_events);
 
-        ngx_queue_remove(&item->queue);
+        if (item->in_queue) {
+            ngx_queue_remove(&item->queue);
+            item->in_queue = 0;
+        }
         ngx_queue_insert_head(&item->conf->free, &item->queue);
+        item->in_queue = 1;
     }
 }
 
@@ -394,7 +399,6 @@ static void ngx_http_upstream_ntlm_dummy_handler(ngx_event_t *ev) {
 static void ngx_http_upstream_ntlm_close_handler(ngx_event_t *ev) {
     ngx_http_upstream_ntlm_srv_conf_t *conf;
     ngx_http_upstream_ntlm_cache_t *item;
-
     int n;
     char buf[1];
     ngx_connection_t *c;
@@ -425,14 +429,17 @@ close:
 
     item = c->data;
     conf = item->conf;
-   
-    // set the item peer connection to null to make sure we don't close it again
-    // when the client connection cleanup is triggered
+
+    /* Indicate that the item no longer has a live peer connection */
     item->peer_connection = NULL;
     ngx_http_upstream_ntlm_close(c);
 
-    ngx_queue_remove(&item->queue);
+    if (item->in_queue) {
+        ngx_queue_remove(&item->queue);
+        item->in_queue = 0;
+    }
     ngx_queue_insert_head(&conf->free, &item->queue);
+    item->in_queue = 1;
 }
 
 static void ngx_http_upstream_ntlm_close(ngx_connection_t *c) {
